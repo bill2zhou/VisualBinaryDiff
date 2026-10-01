@@ -1,0 +1,23 @@
+//--------------------------------------------------------------------
+//
+//   Visual Binary Diff - GUI
+//
+//   Resource script.  Supplies the application icon used by Explorer,
+//   the task bar and the window's title bar.
+//
+//   The icon shows two columns of byte blocks (file 1 on the left in
+//   cyan, file 2 on the right in amber) with one block in red marking
+//   a difference.
+//
+//   This program is free software; you can redistribute it and/or
+//   modify it under the terms of the GNU General Public License as
+//   published by the Free Software Foundation; either version 2 of
+//   the License, or (at your option) any later version.
+//
+//--------------------------------------------------------------------
+
+#include <windows.h>
+
+#define IDI_APPICON 101
+
+IDI_APPICON ICON "VBinDiffGui.ico"
