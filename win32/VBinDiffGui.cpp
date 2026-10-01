@@ -58,6 +58,9 @@
 #ifndef EM_SETSCROLLPOS
 #define EM_SETSCROLLPOS (WM_USER + 222)
 #endif
+#ifndef EM_SETTARGETDEVICE
+#define EM_SETTARGETDEVICE (WM_USER + 72)
+#endif
 
 // Messages posted by the worker thread
 #define WM_APP_PROGRESS (WM_APP + 1)
@@ -520,20 +523,155 @@ static void SetPaneText(HWND hRich, const std::wstring& text,
 
 //--------------------------------------------------------------------
 // Keep the two panes scrolled together so the lines stay aligned.
+//
+// The two panes always have exactly the same line layout (fixed-width
+// 76-character lines, no wrapping), so we sync vertically by *line
+// index*: EM_GETFIRSTVISIBLELINE + EM_LINESCROLL.  Copying the raw
+// scroll position with EM_GETSCROLLPOS/EM_SETSCROLLPOS does not work
+// here: RichEdit snaps the position it is handed to a line boundary and
+// clamps it to the end of the text, so the two panes kept correcting
+// each other's rounding (visible as jitter), and as soon as one of them
+// reached the end of its text the two offsets drifted apart for good.
+//
+// Scrolling the destination pane notifies us again (EN_VSCROLL /
+// EN_HSCROLL), so the guard is needed to stop the notification from
+// bouncing back and forth between the panes.
 
-static void SyncScroll(HWND src)
+static bool g_syncing = false;
+
+static void SyncScroll(HWND src, bool horizontal)
 {
   HWND dst = (src == g_hPane1) ? g_hPane2 : g_hPane1;
-  if (!dst) return;
+  if (!dst || g_syncing) return;
 
-  POINT ps = { 0, 0 }, pd = { 0, 0 };
-  SendMessageW(src, EM_GETSCROLLPOS, 0, (LPARAM)&ps);
-  SendMessageW(dst, EM_GETSCROLLPOS, 0, (LPARAM)&pd);
+  g_syncing = true;
 
-  if (ps.x == pd.x && ps.y == pd.y) return;    // already in sync (stops loops)
+  if (horizontal) {
+    // Both panes use the same font and the same line length, so the
+    // horizontal pixel offset can be copied straight across.  Only x
+    // is touched, which leaves the vertical position alone.
+    POINT ps = { 0, 0 }, pd = { 0, 0 };
+    SendMessageW(src, EM_GETSCROLLPOS, 0, (LPARAM)&ps);
+    SendMessageW(dst, EM_GETSCROLLPOS, 0, (LPARAM)&pd);
 
-  SendMessageW(dst, EM_SETSCROLLPOS, 0, (LPARAM)&ps);
+    if (ps.x != pd.x) {
+      pd.x = ps.x;
+      SendMessageW(dst, EM_SETSCROLLPOS, 0, (LPARAM)&pd);
+    }
+  } else {
+    int first = (int)SendMessageW(src, EM_GETFIRSTVISIBLELINE, 0, 0);
+    int cur   = (int)SendMessageW(dst, EM_GETFIRSTVISIBLELINE, 0, 0);
+    int delta = first - cur;
+
+    // EM_LINESCROLL clamps at the end of the text, so if one pane is
+    // shorter the other just stops alongside it and re-aligns as soon
+    // as the user scrolls back.
+    if (delta != 0)
+      SendMessageW(dst, EM_LINESCROLL, 0, delta);
+  }
+
+  g_syncing = false;
 } // end SyncScroll
+
+//--------------------------------------------------------------------
+// Mouse wheel.
+//
+// The wheel may not be handled by letting RichEdit scroll the pane under
+// the cursor and then syncing the other pane: RichEdit applies the wheel
+// scroll *after* it has handled the message, so the second pane was
+// aligned before the first one had moved and stayed exactly one notch
+// behind (3 lines, off by "one wheel click" no matter how far you
+// scrolled).
+//
+// Instead, scroll both panes here by the same amount and swallow the
+// message, so the two can never get out of step.
+
+static void ScrollPanesByWheel(int delta)
+{
+  if (delta == 0 || g_syncing || !g_hPane1 || !g_hPane2) return;
+
+  int notches = delta / WHEEL_DELTA;
+  if (notches == 0) return;
+
+  bool up = (notches > 0);                 // wheel forward scrolls up
+
+  UINT perNotch = 3;
+  if (!SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &perNotch, 0))
+    perNotch = 3;
+
+  g_syncing = true;
+
+  if (perNotch == 0) {
+    // "No mouse wheel scrolling" - nothing to do.
+  } else if (perNotch == WHEEL_PAGESCROLL || perNotch > 100) {
+    for (int i = 0; i < abs(notches); ++i) {
+      SendMessageW(g_hPane1, WM_VSCROLL, up ? SB_PAGEUP : SB_PAGEDOWN, 0);
+      SendMessageW(g_hPane2, WM_VSCROLL, up ? SB_PAGEUP : SB_PAGEDOWN, 0);
+    }
+  } else {
+    int amount = (int)(perNotch * (UINT)abs(notches));
+    if (up) amount = -amount;
+    SendMessageW(g_hPane1, EM_LINESCROLL, 0, amount);
+    SendMessageW(g_hPane2, EM_LINESCROLL, 0, amount);
+  }
+
+  g_syncing = false;
+} // end ScrollPanesByWheel
+
+//--------------------------------------------------------------------
+// EN_VSCROLL/EN_HSCROLL reliably reports scroll bar activity, but the
+// keyboard and clicking in a pane move the caret without necessarily
+// notifying the parent, so the panes are subclassed and re-aligned
+// after those messages as well.  Syncing twice for one gesture is
+// harmless: SyncScroll does nothing when the panes already agree.
+
+static LRESULT CALLBACK PaneSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
+                                         LPARAM lParam, UINT_PTR idSubclass,
+                                         DWORD_PTR /*refData*/)
+{
+  // Handled before the control sees it (see ScrollPanesByWheel).
+  if (msg == WM_MOUSEWHEEL && g_hPane1 && g_hPane2) {
+    ScrollPanesByWheel(GET_WHEEL_DELTA_WPARAM(wParam));
+    return 0;
+  }
+
+  if (msg == WM_NCDESTROY)
+    RemoveWindowSubclass(hwnd, PaneSubclassProc, idSubclass);
+
+  LRESULT result = DefSubclassProc(hwnd, msg, wParam, lParam);
+
+  switch (msg) {
+    case WM_VSCROLL:   SyncScroll(hwnd, false); break;
+    case WM_HSCROLL:   SyncScroll(hwnd, true);  break;
+    case WM_KEYUP:     SyncScroll(hwnd, false); break;
+    case WM_LBUTTONUP: SyncScroll(hwnd, false); break;
+  }
+
+  return result;
+} // end PaneSubclassProc
+
+//--------------------------------------------------------------------
+// Turn off word wrap in a result pane.
+//
+// This is what actually keeps the two panes aligned.  EM_GETFIRSTVISIBLELINE
+// counts *display* lines, wrapped ones included, and the two panes hold
+// different text: a line is broken at the last whitespace that still fits,
+// and the ASCII column differs between the two sides, so the controls would
+// break at different places.  From the first differing break on, the same
+// screen row showed different line numbers in the two panes, even though
+// the panes were scrolled "to the same line".
+//
+// With wrapping off, every line of output is exactly one display line, so
+// a line index means the same thing on both sides, and the horizontal
+// scroll bar (both panes always have WS_HSCROLL) shows the rest of the line.
+//
+// RichEdit 2.0 and later read lParam = 1 as "do not wrap"; lParam = 0 would
+// switch wrapping back on.
+
+static void DisableWordWrap(HWND hRich)
+{
+  SendMessageW(hRich, EM_SETTARGETDEVICE, 0, 1);
+} // end DisableWordWrap
 
 //====================================================================
 // The comparison job runs on a worker thread so the UI never blocks.
@@ -989,10 +1127,14 @@ static void CreateControls(HWND hwnd)
   if (g_hPane1) {
     SendMessageW(g_hPane1, EM_EXLIMITTEXT, 0, (LPARAM)0x7FFFFFF0);
     SendMessageW(g_hPane1, WM_SETFONT, (WPARAM)g_hFontUi, TRUE);
+    DisableWordWrap(g_hPane1);
+    SetWindowSubclass(g_hPane1, PaneSubclassProc, IDC_PANE1, 0);
   }
   if (g_hPane2) {
     SendMessageW(g_hPane2, EM_EXLIMITTEXT, 0, (LPARAM)0x7FFFFFF0);
     SendMessageW(g_hPane2, WM_SETFONT, (WPARAM)g_hFontUi, TRUE);
+    DisableWordWrap(g_hPane2);
+    SetWindowSubclass(g_hPane2, PaneSubclassProc, IDC_PANE2, 0);
   }
 
   // ---- Status
@@ -1093,9 +1235,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_NOTIFY:
     {
       NMHDR* nh = (NMHDR*)lParam;
-      if ((nh->code == EN_VSCROLL || nh->code == EN_HSCROLL) &&
-          (nh->hwndFrom == g_hPane1 || nh->hwndFrom == g_hPane2)) {
-        SyncScroll(nh->hwndFrom);
+      if (nh->hwndFrom == g_hPane1 || nh->hwndFrom == g_hPane2) {
+        if (nh->code == EN_VSCROLL)      SyncScroll(nh->hwndFrom, false);
+        else if (nh->code == EN_HSCROLL) SyncScroll(nh->hwndFrom, true);
       }
       return 0;
     }
